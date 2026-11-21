@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import asyncssh
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import main  # noqa: E402
 
@@ -142,6 +144,78 @@ class TestComandos(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main.cache, antes)
         self.assertNotIn("secreta", "".join(logs.output))
         self.assertNotIn("secreto", "".join(logs.output))
+
+
+class SFTPFalso:
+    """Imita al cliente de asyncssh: archivos en memoria y rutas que fallan a propósito."""
+
+    def __init__(self, archivos, fallan=(), falla_listar=False):
+        self.archivos, self.fallan, self.falla_listar = archivos, set(fallan), falla_listar
+
+    async def listdir(self, ruta):
+        if self.falla_listar:
+            raise asyncssh.SFTPFailure("failure")
+        prefijo = ruta + "/"
+        return [".", ".."] + [r[len(prefijo):] for r in self.archivos if r.startswith(prefijo)]
+
+    async def open(self, ruta, modo, block_size=-1):
+        assert modo == "rb" and block_size == 0, (modo, block_size)  # solo lectura, sin lecturas en paralelo
+        if ruta in self.fallan:
+            raise asyncssh.SFTPFailure("failure")
+        datos, pos = self.archivos[ruta], 0
+
+        class Archivo:
+            async def read(_, n):
+                nonlocal pos
+                parte, pos = datos[pos:pos + n], pos + n
+                return parte
+
+            async def close(_):
+                pass
+
+        return Archivo()
+
+
+class TestDescargaSFTP(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        usercache, stats = jugadores_falsos()
+        self.archivos = {"usercache.json": usercache.encode()}
+        self.archivos.update({f"world/stats/{u}.json": t.encode() for u, t in stats.items()})
+        self.archivos["world/stats/notas.txt"] = b"no es json de stats"
+        self.uno = "world/stats/00000001-0000-0000-0000-000000000000.json"  # alex
+
+    async def test_lee_todo_por_bloques(self):
+        with mock.patch.object(main, "BLOQUE_SFTP", 1000):  # el ejemplo (~12 KB) necesita varias lecturas
+            usercache, stats = await main.descargar_de(SFTPFalso(self.archivos))
+        self.assertEqual(sorted(main.procesar(usercache, stats)), ["Notch", "Steve_mc_", "alex"])
+
+    async def test_archivo_que_falla_se_salta(self):
+        with self.assertLogs("bot-mc", "WARNING") as logs:
+            usercache, stats = await main.descargar_de(SFTPFalso(self.archivos, fallan=[self.uno]))
+        self.assertEqual(sorted(main.procesar(usercache, stats)), ["Notch", "Steve_mc_"])
+        self.assertIn(f"abrir '{self.uno}': SFTPFailure (código 4): failure", logs.output[0])
+
+    async def test_errores_dicen_operacion_y_ruta(self):
+        casos = [
+            (SFTPFalso(self.archivos, falla_listar=True), "listar 'world/stats': SFTPFailure (código 4)"),
+            (SFTPFalso(self.archivos, fallan=["usercache.json"]), "abrir 'usercache.json': SFTPFailure"),
+            (SFTPFalso(self.archivos, fallan=[r for r in self.archivos if r.endswith(".json") and "stats" in r]),
+             "no se pudo leer ninguno de los 3 archivos de 'world/stats'"),
+        ]
+        for sftp, esperado in casos:
+            with self.subTest(esperado), self.assertRaises(main.FalloSFTP) as ctx:
+                await main.descargar_de(sftp)
+            self.assertIn(esperado, str(ctx.exception))
+
+    async def test_fallo_total_conserva_cache(self):
+        main.cache.update(jugadores={"previo": {}}, actualizado=123.0)
+        sftp = SFTPFalso(self.archivos, falla_listar=True)
+        with mock.patch.object(main, "descargar_stats", lambda: main.descargar_de(sftp)), \
+                self.assertLogs("bot-mc", "WARNING") as logs:
+            await main.refrescar_cache()
+        self.assertEqual(main.cache, {"jugadores": {"previo": {}}, "actualizado": 123.0})
+        self.assertIn("listar 'world/stats'", logs.output[0])
+        main.cache.update(jugadores={}, actualizado=None)
 
 
 class TestPresencia(unittest.IsolatedAsyncioTestCase):

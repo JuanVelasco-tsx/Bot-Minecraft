@@ -32,6 +32,7 @@ SFTP_HOST_KEY = os.getenv("SFTP_HOST_KEY", "").strip()
 MC_WORLD = os.getenv("MC_WORLD", "").strip() or "world"
 STATS_ACTIVAS = bool(SFTP_HOST and SFTP_USER and SFTP_PASSWORD)
 TIMEOUT_SFTP = 120  # segundos máximos para descargar todo
+BLOQUE_SFTP = 16_384  # bytes por lectura: tamaño seguro para cualquier servidor SFTP
 
 # Bloques que NO cuentan como "picados": plantas, flores, pasto, cultivos, fuego y antorchas.
 # Para editarla, agrega o quita nombres (sin el prefijo "minecraft:"), separados por espacios.
@@ -135,7 +136,7 @@ def calcular_metricas(datos):
 
 
 def procesar(usercache_txt, stats):
-    """Convierte usercache.json + {uuid: texto del json} en {nombre: métricas}."""
+    """Convierte usercache.json + {uuid: json en bytes o texto} en {nombre: métricas}."""
     nombres = {e["uuid"]: e["name"] for e in json.loads(usercache_txt)}
     jugadores = {}
     for uuid, texto in stats.items():
@@ -157,16 +158,57 @@ async def descargar_stats():
         SFTP_HOST, port=int(SFTP_PORT), username=SFTP_USER, password=SFTP_PASSWORD,
         known_hosts=known_hosts, client_keys=None,
     ) as conn, conn.start_sftp_client() as sftp:
-        async def leer(ruta):
-            async with sftp.open(ruta, "r") as f:  # "r" = solo lectura
-                return await f.read()
+        return await descargar_de(sftp)
 
-        usercache = await leer("usercache.json")
-        stats = {}
-        for archivo in await sftp.listdir(f"{MC_WORLD}/stats"):
-            if archivo.endswith(".json"):
-                stats[archivo[:-5]] = await leer(f"{MC_WORLD}/stats/{archivo}")
-        return usercache, stats
+
+class FalloSFTP(Exception):
+    """Error SFTP con la operación y la ruta que fallaron (nunca incluye credenciales)."""
+
+
+def fallo(operacion, ruta, e):
+    return FalloSFTP(f"{operacion} '{ruta}': {type(e).__name__} (código {e.code}): {e.reason}")
+
+
+async def leer_archivo(sftp, ruta):
+    """Abre en "rb" (solo lectura) y lee por bloques hasta el final.
+
+    No usa read() sin tamaño: asyncssh haría un fstat para saber el largo, y Wings puede rechazarlo.
+    """
+    try:
+        f = await sftp.open(ruta, "rb", block_size=0)  # 0 = un FXP_READ simple por read(), sin paralelismo
+    except asyncssh.SFTPError as e:
+        raise fallo("abrir", ruta, e) from e
+    try:
+        partes = []
+        while parte := await f.read(BLOQUE_SFTP):  # b"" al llegar al final
+            partes.append(parte)
+        return b"".join(partes)
+    except asyncssh.SFTPError as e:
+        raise fallo("leer", ruta, e) from e
+    finally:
+        try:
+            await f.close()
+        except asyncssh.SFTPError:
+            pass  # cerrar un archivo de solo lectura que ya leímos no afecta los datos
+
+
+async def descargar_de(sftp):
+    """usercache.json + {uuid: bytes} de <mundo>/stats. Solo usa listdir, open "rb" y read."""
+    usercache = await leer_archivo(sftp, "usercache.json")
+    carpeta = f"{MC_WORLD}/stats"
+    try:
+        archivos = [a for a in await sftp.listdir(carpeta) if a.endswith(".json")]
+    except asyncssh.SFTPError as e:
+        raise fallo("listar", carpeta, e) from e
+    stats = {}
+    for archivo in archivos:
+        try:
+            stats[archivo[:-5]] = await leer_archivo(sftp, f"{carpeta}/{archivo}")
+        except FalloSFTP as e:  # un archivo que falla no tumba la actualización
+            log.warning("Se salta un archivo de stats: %s", e)
+    if archivos and not stats:
+        raise FalloSFTP(f"no se pudo leer ninguno de los {len(archivos)} archivos de '{carpeta}'")
+    return usercache, stats
 
 
 async def refrescar_cache():
